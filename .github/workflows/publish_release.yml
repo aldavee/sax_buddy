@@ -1,0 +1,538 @@
+name: Build and Publish Android & Windows Releases
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional version override (e.g. 1.0.0+2)'
+        required: false
+        type: string
+      make_latest:
+        description: 'Mark this build as the Latest release on Release Portal'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    name: Prepare Google Drive Target & Version
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      folder_id: ${{ steps.gdrive_prepare.outputs.folder_id }}
+      manifest_file_id: ${{ steps.gdrive_prepare.outputs.manifest_file_id }}
+      version_folder_id: ${{ steps.gdrive_version_folder.outputs.version_folder_id }}
+      version: ${{ steps.app_version.outputs.version }}
+      build_name: ${{ steps.app_version.outputs.build_name }}
+      build_number: ${{ steps.app_version.outputs.build_number }}
+      tag_name: ${{ steps.app_version.outputs.tag_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free Runner Disk Space on GitHub-Hosted Ubuntu
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]]; then
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+            docker image prune -af >/dev/null 2>&1 || true
+          fi
+
+      - name: Pre-flight Validate Android Signing Credentials
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          set_count=0
+          for var in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            [[ -n "${!var:-}" ]] && set_count=$((set_count + 1))
+          done
+          if (( set_count == 0 )); then
+            echo "::warning::No Android release signing secrets configured; build will use debug signing fallback."
+            exit 0
+          fi
+          if (( set_count < 4 )); then
+            echo "::error::Incomplete Android signing secrets ($set_count/4 set). Configure all 4: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD."
+            exit 1
+          fi
+          tmp_dir="$RUNNER_TEMP/preflight-signing"
+          mkdir -p "$tmp_dir"
+          ks="$tmp_dir/release-keystore.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ks"
+          keytool -list -v -keystore "$ks" -storepass "$ANDROID_KEYSTORE_PASSWORD" -alias "$ANDROID_KEY_ALIAS" > /dev/null
+          printf '%s\n' \
+            'import java.io.File;' \
+            'import java.security.Key;' \
+            'import java.security.KeyStore;' \
+            'public class VerifyKey {' \
+            '  public static void main(String[] args) throws Exception {' \
+            '    KeyStore ks = KeyStore.getInstance(new File(args[0]), args[1].toCharArray());' \
+            '    Key k = ks.getKey(args[2], args[3].toCharArray());' \
+            '    if (k == null) throw new RuntimeException("Alias not found: " + args[2]);' \
+            '  }' \
+            '}' > "$tmp_dir/VerifyKey.java"
+          java "$tmp_dir/VerifyKey.java" "$ks" "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD"
+          rm -rf "$tmp_dir"
+          echo "Android signing keystore and private key credentials verified."
+
+      - name: Prepare Google Drive Release Target
+        id: gdrive_prepare
+        shell: bash
+        env:
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID || vars.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_RELEASE_FOLDER_ID: ${{ secrets.GDRIVE_RELEASE_FOLDER_ID || vars.GDRIVE_RELEASE_FOLDER_ID }}
+          GDRIVE_MANIFEST_FILE_ID: ${{ secrets.GDRIVE_MANIFEST_FILE_ID || vars.GDRIVE_MANIFEST_FILE_ID }}
+        run: |
+          set -euo pipefail
+          python3 scripts/gdrive_release.py prepare --public "${{ vars.GDRIVE_PUBLIC_RELEASES || 'true' }}"
+
+      - name: Resolve Application Version (Monotonic Build Increment via Google Drive)
+        id: app_version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          GDRIVE_MAX_BUILD: ${{ steps.gdrive_prepare.outputs.max_build || '0' }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin 2>/dev/null || true
+          tag_max_build="$(git tag -l | grep -o '\+[0-9]\+' | tr -d '+' | sort -n | tail -n 1 || true)"
+          if [[ -z "$tag_max_build" || ! "$tag_max_build" =~ ^[0-9]+$ ]]; then
+            tag_max_build=0
+          fi
+
+          drive_max_build="${GDRIVE_MAX_BUILD:-0}"
+          if [[ ! "$drive_max_build" =~ ^[0-9]+$ ]]; then
+            drive_max_build=0
+          fi
+
+          highest_published_build="$tag_max_build"
+          if (( drive_max_build > highest_published_build )); then
+            highest_published_build="$drive_max_build"
+          fi
+
+          pub_version="$(grep '^version:' pubspec.yaml | head -n 1 | awk '{print $2}' | tr -d '\r ')"
+          pub_name="${pub_version%%+*}"
+          pub_build=0
+          if [[ "$pub_version" == *"+"* ]]; then
+            candidate_build="${pub_version##*+}"
+            if [[ "$candidate_build" =~ ^[0-9]+$ ]]; then
+              pub_build="$candidate_build"
+            fi
+          fi
+
+          input_clean="$(echo "${INPUT_VERSION:-}" | tr -d '\r ')"
+          if [[ -n "$input_clean" ]]; then
+            target_name="${input_clean%%+*}"
+            if [[ "$input_clean" == *"+"* ]]; then
+              cand_input_build="${input_clean##*+}"
+              target_build="${cand_input_build:-0}"
+            else
+              target_build=0
+            fi
+          else
+            target_name="$pub_name"
+            target_build="$pub_build"
+          fi
+
+          if (( target_build <= highest_published_build )); then
+            target_build=$(( highest_published_build + 1 ))
+          fi
+
+          final_version="${target_name}+${target_build}"
+          tag_name="v${final_version}"
+
+          echo "version=$final_version" >> "$GITHUB_OUTPUT"
+          echo "build_name=$target_name" >> "$GITHUB_OUTPUT"
+          echo "build_number=$target_build" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Google Drive Version Subfolder
+        id: gdrive_version_folder
+        shell: bash
+        env:
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID || vars.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python3 scripts/gdrive_release.py ensure-folder \
+            --folder-id "${{ steps.gdrive_prepare.outputs.folder_id }}" \
+            --tag "${{ steps.app_version.outputs.tag_name }}" \
+            --public "${{ vars.GDRIVE_PUBLIC_RELEASES || 'true' }}"
+
+  build-and-release:
+    name: Build Signed APK & Upload to Google Drive (0% GitHub Storage)
+    needs: prepare-release
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: production
+    outputs:
+      apks_json: ${{ steps.gdrive_upload_apks.outputs.apks_json }}
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dorg.gradle.vfs.watch=false -Dorg.gradle.daemon=false -Dkotlin.incremental=true -Dkotlin.compiler.execution.strategy=in-process -Xmx8g -XX:MaxMetaspaceSize=2g -XX:+UseG1GC -XX:+ParallelRefProcEnabled"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free Runner Disk Space on GitHub-Hosted Ubuntu
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]]; then
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+            docker image prune -af >/dev/null 2>&1 || true
+          fi
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle Acceleration & Dependency Cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-home-cache-cleanup: true
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare pubspec.yaml version for build
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          perl -0pi -e 's/^version:\s*.*$/version: $ENV{APP_VERSION}/m' pubspec.yaml
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Run code analysis & unit tests
+        run: |
+          flutter analyze --no-fatal-infos
+          flutter test
+
+      - name: Configure and Validate Android Signing Key (if secrets provided)
+        id: check_signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "${ANDROID_KEYSTORE_PASSWORD:-}" && -n "${ANDROID_KEY_ALIAS:-}" && -n "${ANDROID_KEY_PASSWORD:-}" ]]; then
+            signing_dir="$RUNNER_TEMP/android-signing"
+            mkdir -p "$signing_dir"
+            keystore_path="$signing_dir/release-keystore.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+            keytool -list -v \
+              -keystore "$keystore_path" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" > /dev/null
+            printf '%s\n' \
+              'import java.io.File;' \
+              'import java.security.Key;' \
+              'import java.security.KeyStore;' \
+              'public class VerifyKey {' \
+              '  public static void main(String[] args) throws Exception {' \
+              '    KeyStore ks = KeyStore.getInstance(new File(args[0]), args[1].toCharArray());' \
+              '    Key k = ks.getKey(args[2], args[3].toCharArray());' \
+              '    if (k == null) throw new RuntimeException("Alias not found: " + args[2]);' \
+              '  }' \
+              '}' > "$signing_dir/VerifyKey.java"
+            java "$signing_dir/VerifyKey.java" "$keystore_path" "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD"
+            echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+            echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No release keystore secrets found. Building with debug fallback."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Android Release APK (Split Per ABI)
+        env:
+          GDRIVE_API_KEY: ${{ secrets.GDRIVE_API_KEY || vars.GDRIVE_API_KEY || '' }}
+          GOOGLE_DESKTOP_CLIENT_ID: ${{ secrets.GOOGLE_DESKTOP_CLIENT_ID || vars.GOOGLE_DESKTOP_CLIENT_ID || '' }}
+          GOOGLE_DESKTOP_CLIENT_SECRET: ${{ secrets.GOOGLE_DESKTOP_CLIENT_SECRET || '' }}
+        run: >-
+          flutter build apk --release --split-per-abi
+          --android-skip-build-dependency-validation
+          --build-name="${{ needs.prepare-release.outputs.build_name }}"
+          --build-number="${{ needs.prepare-release.outputs.build_number }}"
+          --dart-define=APP_VERSION="${{ needs.prepare-release.outputs.version }}"
+          --dart-define=GDRIVE_ONLY=true
+          --dart-define=GDRIVE_RELEASE_FOLDER_ID="${{ needs.prepare-release.outputs.folder_id }}"
+          --dart-define=GDRIVE_MANIFEST_FILE_ID="${{ needs.prepare-release.outputs.manifest_file_id }}"
+          --dart-define=GDRIVE_API_KEY="$GDRIVE_API_KEY"
+          --dart-define=GOOGLE_DESKTOP_CLIENT_ID="$GOOGLE_DESKTOP_CLIENT_ID"
+          --dart-define=GOOGLE_DESKTOP_CLIENT_SECRET="$GOOGLE_DESKTOP_CLIENT_SECRET"
+
+      - name: Validate Generated APKs Before Publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_tools_dir="$ANDROID_HOME/build-tools/$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          apksigner_bin="$build_tools_dir/apksigner"
+          zipalign_bin="$build_tools_dir/zipalign"
+          aapt_bin="$build_tools_dir/aapt"
+          expected_package="com.aldavelabs.sax_buddy"
+
+          required_apks=(
+            "build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+            "build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk"
+            "build/app/outputs/flutter-apk/app-x86_64-release.apk"
+          )
+
+          for apk in "${required_apks[@]}"; do
+            if [[ ! -f "$apk" ]]; then
+              echo "::error::Required APK $apk was not produced!"
+              exit 1
+            fi
+            size=$(stat -c%s "$apk" 2>/dev/null || stat -f%z "$apk")
+            if (( size < 10000000 )); then
+              echo "::error::$apk is suspiciously small ($size bytes)!"
+              exit 1
+            fi
+            "$zipalign_bin" -c 4 "$apk"
+            "$apksigner_bin" verify --verbose "$apk"
+            pkg_name=$("$aapt_bin" dump badging "$apk" | grep -o "package: name='[^']*'" | cut -d"'" -f2)
+            if [[ "$pkg_name" != "$expected_package" ]]; then
+              echo "::error::Package name mismatch in $apk! Expected $expected_package, got $pkg_name"
+              exit 1
+            fi
+          done
+
+      - name: Reclaim Build Intermediates & Stage Release APKs
+        id: stage_apks
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build/app/intermediates build/app/tmp build/app/kotlin
+          apk_dir="build/app/outputs/flutter-apk"
+          ver="${{ needs.prepare-release.outputs.version }}"
+          asset_name="sax-buddy-${ver}.apk"
+          asset_path="$apk_dir/$asset_name"
+          arm64_apk="$apk_dir/sax-buddy-${ver}-arm64-v8a.apk"
+          armeabi_apk="$apk_dir/sax-buddy-${ver}-armeabi-v7a.apk"
+          x86_64_apk="$apk_dir/sax-buddy-${ver}-x86_64.apk"
+
+          mv -f "$apk_dir/app-arm64-v8a-release.apk" "$arm64_apk"
+          mv -f "$apk_dir/app-armeabi-v7a-release.apk" "$armeabi_apk"
+          mv -f "$apk_dir/app-x86_64-release.apk" "$x86_64_apk"
+          cp -f "$arm64_apk" "$asset_path"
+
+          echo "path=$asset_path" >> "$GITHUB_OUTPUT"
+          echo "arm64=$arm64_apk" >> "$GITHUB_OUTPUT"
+          echo "armeabi=$armeabi_apk" >> "$GITHUB_OUTPUT"
+          echo "x86_64=$x86_64_apk" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Release APKs to Google Drive
+        id: gdrive_upload_apks
+        shell: bash
+        env:
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID || vars.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python3 scripts/gdrive_release.py upload \
+            --version-folder-id "${{ needs.prepare-release.outputs.version_folder_id }}" \
+            --tag "${{ needs.prepare-release.outputs.tag_name }}" \
+            --public "${{ vars.GDRIVE_PUBLIC_RELEASES || 'true' }}" \
+            "${{ steps.stage_apks.outputs.path }}" \
+            "${{ steps.stage_apks.outputs.arm64 }}" \
+            "${{ steps.stage_apks.outputs.armeabi }}" \
+            "${{ steps.stage_apks.outputs.x86_64 }}"
+
+  build-windows:
+    name: Build Windows x64 Desktop & Upload to Google Drive (0% GitHub Storage)
+    needs: prepare-release
+    runs-on: windows-latest
+    environment: production
+    outputs:
+      desktop_json: ${{ steps.gdrive_upload_windows.outputs.desktop_json }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare pubspec.yaml version for Windows build
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          $content = Get-Content -Path pubspec.yaml -Raw
+          $updated = [regex]::Replace($content, '(?m)^version:\s*.*$', "version: $($env:APP_VERSION)")
+          Set-Content -Path pubspec.yaml -Value $updated -NoNewline
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Windows Desktop Release
+        shell: pwsh
+        env:
+          GDRIVE_API_KEY: ${{ secrets.GDRIVE_API_KEY || vars.GDRIVE_API_KEY || '' }}
+          GOOGLE_DESKTOP_CLIENT_ID: ${{ secrets.GOOGLE_DESKTOP_CLIENT_ID || vars.GOOGLE_DESKTOP_CLIENT_ID || '' }}
+          GOOGLE_DESKTOP_CLIENT_SECRET: ${{ secrets.GOOGLE_DESKTOP_CLIENT_SECRET || '' }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GOOGLE_DESKTOP_CLIENT_SECRET)) {
+            Write-Host "::warning::GOOGLE_DESKTOP_CLIENT_SECRET is not set in GitHub production secrets; Google OAuth token exchange on Desktop requires this secret."
+          }
+          flutter build windows --release `
+            --build-name="${{ needs.prepare-release.outputs.build_name }}" `
+            --build-number="${{ needs.prepare-release.outputs.build_number }}" `
+            --dart-define=APP_VERSION="${{ needs.prepare-release.outputs.version }}" `
+            --dart-define=GDRIVE_ONLY=true `
+            --dart-define=GDRIVE_RELEASE_FOLDER_ID="${{ needs.prepare-release.outputs.folder_id }}" `
+            --dart-define=GDRIVE_MANIFEST_FILE_ID="${{ needs.prepare-release.outputs.manifest_file_id }}" `
+            --dart-define=GDRIVE_API_KEY="$($env:GDRIVE_API_KEY)" `
+            --dart-define=GOOGLE_DESKTOP_CLIENT_ID="$($env:GOOGLE_DESKTOP_CLIENT_ID)" `
+            --dart-define=GOOGLE_DESKTOP_CLIENT_SECRET="$($env:GOOGLE_DESKTOP_CLIENT_SECRET)"
+
+      - name: Install WiX Toolset for Windows MSI Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
+            dotnet tool install --global wix --version 5.*
+          }
+          wix --version
+
+      - name: Validate & Package Windows Release Bundle (MSI Installer + Portable ZIP)
+        id: package_windows
+        shell: pwsh
+        run: |
+          $releaseDir = (Resolve-Path "build\windows\x64\runner\Release").Path
+          $exePath = Join-Path $releaseDir "sax_buddy.exe"
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Required Windows executable $exePath was not produced!"
+            exit 1
+          }
+          $exeSize = (Get-Item $exePath).Length
+          if ($exeSize -lt 10000) {
+            Write-Error "Windows executable $exePath is suspiciously small ($exeSize bytes)!"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "release-staging\windows" | Out-Null
+
+          $buildNameRaw = "${{ needs.prepare-release.outputs.build_name }}" -replace '[^0-9.]', ''
+          $nameParts = @($buildNameRaw.Split('.') | Where-Object { $_ -ne '' })
+          while ($nameParts.Count -lt 3) { $nameParts += '0' }
+          $buildNumRaw = "${{ needs.prepare-release.outputs.build_number }}" -replace '[^0-9]', ''
+          if (-not $buildNumRaw) { $buildNumRaw = '0' }
+          $msiVersion = "$($nameParts[0]).$($nameParts[1]).$($nameParts[2]).$buildNumRaw"
+
+          $iconPath = (Resolve-Path "windows\runner\resources\app_icon.ico").Path
+          $msiName = "sax-buddy-${{ needs.prepare-release.outputs.version }}-windows-x64.msi"
+          $msiPath = Join-Path "release-staging\windows" $msiName
+          wix build windows\installer\SaxBuddy.wxs `
+            -d "SourceDir=$releaseDir" `
+            -d "IconPath=$iconPath" `
+            -d "MsiVersion=$msiVersion" `
+            -arch x64 `
+            -o $msiPath
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msiPath) -or (Get-Item $msiPath).Length -lt 100000) {
+            Write-Error "Failed to produce valid MSI installer at $msiPath"
+            exit 1
+          }
+
+          $zipName = "sax-buddy-${{ needs.prepare-release.outputs.version }}-windows-x64.zip"
+          $zipPath = Join-Path "release-staging\windows" $zipName
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipPath -Force
+          "msi_path=$msiPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish Windows Release Bundle to Google Drive
+        id: gdrive_upload_windows
+        shell: pwsh
+        env:
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID || vars.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python scripts/gdrive_release.py upload `
+            --version-folder-id "${{ needs.prepare-release.outputs.version_folder_id }}" `
+            --tag "${{ needs.prepare-release.outputs.tag_name }}" `
+            --public "${{ vars.GDRIVE_PUBLIC_RELEASES || 'true' }}" `
+            --desktop "${{ steps.package_windows.outputs.msi_path }}" "${{ steps.package_windows.outputs.zip_path }}"
+
+  finalize-release-manifest:
+    name: Finalize Google Drive Manifest & Release Summary
+    needs: [prepare-release, build-and-release, build-windows]
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Finalize Google Drive Release Manifest
+        id: gdrive_finalize
+        shell: bash
+        env:
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID || vars.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          APKS_JSON: ${{ needs.build-and-release.outputs.apks_json }}
+          DESKTOP_JSON: ${{ needs.build-windows.outputs.desktop_json }}
+        run: |
+          set -euo pipefail
+          python3 scripts/gdrive_release.py finalize \
+            --tag "${{ needs.prepare-release.outputs.tag_name }}" \
+            --version "${{ needs.prepare-release.outputs.version }}" \
+            --folder-id "${{ needs.prepare-release.outputs.folder_id }}" \
+            --manifest-id "${{ needs.prepare-release.outputs.manifest_file_id }}" \
+            --version-folder-id "${{ needs.prepare-release.outputs.version_folder_id }}" \
+            --public "${{ vars.GDRIVE_PUBLIC_RELEASES || 'true' }}" \
+            --notes "Sax Buddy Release ${{ needs.prepare-release.outputs.version }} (Android APKs + Windows x64 Desktop hosted on Google Drive)."
+
+      - name: Write Google Drive Release Summary
+        shell: bash
+        env:
+          APK_SUMMARY: ${{ steps.gdrive_finalize.outputs.apk_links_markdown }}
+        run: |
+          {
+            echo "## Sax Buddy ${{ needs.prepare-release.outputs.version }} (Google Drive Only)"
+            echo ""
+            echo "0% GitHub storage, 0% GitHub Releases used. Includes Android split APKs and Windows x64 Desktop."
+            echo ""
+            printf '%s\n' "$APK_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY"

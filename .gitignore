@@ -1,0 +1,88 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.swp
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+**/macos/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+release-staging/
+
+# Desktop (Windows / Linux / macOS) ephemeral & local build artifacts
+windows/flutter/ephemeral/
+linux/flutter/ephemeral/
+macos/Flutter/ephemeral/
+macos/Pods/
+**/DerivedData/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.apk
+*.aab
+*.msix
+*.msi
+*.dmg
+*.AppImage
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Android/Gradle local state & signing keys
+*.jks
+*.keystore
+key.properties
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/captures/
+android/**/GeneratedPluginRegistrant.java
+android/**/key.properties
+android/**/*.keystore
+android/**/*.jks
+/android/build/
+.cxx/
+**/.cxx/
